@@ -268,8 +268,10 @@ public class QuorumCnxManager {
         this.view = view;
         this.listenOnAllIPs = listenOnAllIPs;
 
-        initializeAuth(mySid, authServer, authLearner, quorumCnxnThreadsSize,
+        initializeAuth(mySid, authServer, authLearner,
                 quorumSaslAuthEnabled);
+
+        initializeConnectionExecutors(quorumCnxnThreadsSize);
 
         // Starts listener thread that waits for connection requests
         listener = new Listener();
@@ -279,15 +281,13 @@ public class QuorumCnxManager {
     private void initializeAuth(final long mySid,
                                 final QuorumAuthServer authServer,
                                 final QuorumAuthLearner authLearner,
-                                final int quorumCnxnThreadsSize,
                                 final boolean quorumSaslAuthEnabled) {
         this.authServer = authServer;
         this.authLearner = authLearner;
         this.quorumSaslAuthEnabled = quorumSaslAuthEnabled;
-        if (!this.quorumSaslAuthEnabled) {
-            LOG.debug("Not initializing connection executor as quorum sasl auth is disabled");
-            return;
-        }
+    }
+
+    private void initializeConnectionExecutors(final int quorumCnxnThreadsSize) {
 
         // init connection executors
         final AtomicInteger threadIndex = new AtomicInteger(1);
@@ -343,18 +343,17 @@ public class QuorumCnxManager {
      * Server will initiate the connection request to its peer server
      * asynchronously via separate connection thread.
      */
-    public void initiateConnectionAsync(final Socket sock, final Long sid) {
+    public void initiateConnectionAsync(final Long sid, InetSocketAddress electionAddr) {
         if(!inprogressConnections.add(sid)){
             // simply return as there is a connection request to
             // server 'sid' already in progress.
             LOG.debug("Connection request to server id: {} is already in progress, so skipping this request",
                     sid);
-            closeSocket(sock);
             return;
         }
         try {
             connectionExecutor.execute(
-                    new QuorumConnectionReqThread(sock, sid));
+                    new QuorumConnectionReqThread(sid, electionAddr));
             connectionThreadCnt.incrementAndGet();
         } catch (Throwable e) {
             // Imp: Safer side catching all type of exceptions and remove 'sid'
@@ -362,7 +361,6 @@ public class QuorumCnxManager {
             // connection requests from this 'sid' in case of errors.
             inprogressConnections.remove(sid);
             LOG.error("Exception while submitting quorum connection request", e);
-            closeSocket(sock);
         }
     }
 
@@ -370,18 +368,35 @@ public class QuorumCnxManager {
      * Thread to send connection request to peer server.
      */
     private class QuorumConnectionReqThread extends ZooKeeperThread {
-        final Socket sock;
         final Long sid;
-        QuorumConnectionReqThread(final Socket sock, final Long sid) {
+        final InetSocketAddress electionAddr;
+        QuorumConnectionReqThread(final Long sid, InetSocketAddress electionAddr) {
             super("QuorumConnectionReqThread-" + sid);
-            this.sock = sock;
             this.sid = sid;
+            this.electionAddr = electionAddr;
         }
 
         @Override
         public void run() {
-            try{
+            try {
+                final Socket sock = new Socket();
+                setSockOpts(sock);
+                LOG.debug("Opening channel to server " + sid);
+                sock.connect(electionAddr, cnxTO);
+                LOG.debug("Connected to server " + sid);
                 initiateConnection(sock, sid);
+            } catch (UnresolvedAddressException e) {
+                // Sun doesn't include the address that causes this
+                // exception to be thrown, also UAE cannot be wrapped cleanly
+                // so we log the exception in order to capture this critical
+                // detail.
+                LOG.warn("Cannot open channel to " + sid
+                        + " at election address " + electionAddr, e);
+                throw e;
+            } catch (IOException e) {
+                LOG.warn("Cannot open channel to " + sid
+                                + " at election address " + electionAddr,
+                        e);
             } finally {
                 inprogressConnections.remove(sid);
             }
@@ -617,7 +632,6 @@ public class QuorumCnxManager {
                  addToSendQueue(bq, b);
              }
              connectOne(sid);
-                
         }
     }
     
@@ -627,46 +641,12 @@ public class QuorumCnxManager {
      *  @param sid  server id
      *  @return boolean success indication
      */
-    synchronized private boolean connectOne(long sid, InetSocketAddress electionAddr){
+    synchronized private void connectOne(long sid, InetSocketAddress electionAddr){
         if (senderWorkerMap.get(sid) != null) {
             LOG.debug("There is a connection already for server " + sid);
-            return true;
+            return;
         }
-
-        Socket sock = null;
-        try {
-             LOG.debug("Opening channel to server " + sid);
-             sock = new Socket();
-             setSockOpts(sock);
-             sock.connect(electionAddr, cnxTO);
-             LOG.debug("Connected to server " + sid);
-            // Sends connection request asynchronously if the quorum
-            // sasl authentication is enabled. This is required because
-            // sasl server authentication process may take few seconds to
-            // finish, this may delay next peer connection requests.
-            if (quorumSaslAuthEnabled) {
-                initiateConnectionAsync(sock, sid);
-            } else {
-                initiateConnection(sock, sid);
-            }
-             return true;
-         } catch (UnresolvedAddressException e) {
-             // Sun doesn't include the address that causes this
-             // exception to be thrown, also UAE cannot be wrapped cleanly
-             // so we log the exception in order to capture this critical
-             // detail.
-             LOG.warn("Cannot open channel to " + sid
-                     + " at election address " + electionAddr, e);
-             closeSocket(sock);
-             throw e;
-         } catch (IOException e) {
-             LOG.warn("Cannot open channel to " + sid
-                     + " at election address " + electionAddr,
-                     e);
-             closeSocket(sock);
-             return false;
-         }
-   
+        initiateConnectionAsync(sid, electionAddr);
     }
     
     /**
@@ -689,15 +669,15 @@ public class QuorumCnxManager {
             Map<Long, QuorumPeer.QuorumServer> lastProposedView = lastSeenQV.getAllMembers();
             if (lastCommittedView.containsKey(sid)) {
                 knownId = true;
-                if (connectOne(sid, lastCommittedView.get(sid).electionAddr))
-                    return;
+                connectOne(sid, lastCommittedView.get(sid).electionAddr);
+                return;
             }
             if (lastSeenQV != null && lastProposedView.containsKey(sid)
                     && (!knownId || (lastProposedView.get(sid).electionAddr !=
                     lastCommittedView.get(sid).electionAddr))) {
                 knownId = true;
-                if (connectOne(sid, lastProposedView.get(sid).electionAddr))
-                    return;
+                connectOne(sid, lastProposedView.get(sid).electionAddr);
+                return;
             }
             if (!knownId) {
                 LOG.warn("Invalid server id: " + sid);
